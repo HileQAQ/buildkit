@@ -1,11 +1,17 @@
 package cache
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"strconv"
 
+	obdlabel "github.com/containerd/accelerated-container-image/pkg/label"
+	obdcmd "github.com/containerd/accelerated-container-image/pkg/utils"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/diff"
 	"github.com/containerd/containerd/diff/walking"
 	"github.com/containerd/containerd/leases"
@@ -96,7 +102,17 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 
 				compressorFunc, finalize := comp.Type.Compress(ctx, comp)
 				mediaType := comp.Type.MediaType()
-
+				var isOverlaybd = false
+				if sr.cm.Snapshotter.Name() == "overlaybd" {
+					snStat, err := sr.cm.Snapshotter.Stat(ctx, sr.getSnapshotID())
+					if err != nil {
+						return nil, err
+					}
+					if snStat.Labels[obdlabel.LocalOverlayBDPath] != "" {
+						isOverlaybd = true
+						mediaType = ocispecs.MediaTypeImageLayer
+					}
+				}
 				var lowerRef *immutableRef
 				switch sr.kind() {
 				case Diff:
@@ -162,7 +178,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 						// (in which case lower and upper may differ by more than one layer), so print warn log on unexpected
 						// failure.
 						logWarnOnErr = sr.kind() != Diff
-					case "fuse-overlayfs", "native":
+					case "fuse-overlayfs", "native", "overlaybd":
 						// not supported with fuse-overlayfs snapshotter which doesn't provide overlayfs mounts.
 						// TODO: add support for fuse-overlayfs
 						enableOverlay = false
@@ -186,6 +202,13 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					if ok {
 						desc = computed
 					}
+				}
+
+				if isOverlaybd {
+					if err := commitOverlaybd(ctx, sr, &desc); err != nil {
+						return nil, err
+					}
+					desc.MediaType = mediaType
 				}
 
 				if desc.Digest == "" && !isTypeWindows(sr) && comp.Type.NeedsComputeDiffBySelf() {
@@ -461,4 +484,46 @@ func ensureCompression(ctx context.Context, ref *immutableRef, comp compression.
 		return nil, nil
 	})
 	return err
+}
+
+func commitOverlaybd(ctx context.Context, sr *immutableRef, desc *ocispecs.Descriptor) error {
+	snStat, err := sr.cm.Snapshotter.Stat(ctx, sr.getSnapshotID())
+	if err != nil {
+		return errors.Wrapf(err, "failed to Stat overlaybd")
+	}
+	dir := path.Dir(snStat.Labels[obdlabel.LocalOverlayBDPath])
+	commitPath := path.Join(dir, "overlaybd.commit")
+	err = obdcmd.Commit(ctx, dir, dir, true, "-t", "-z")
+	if err != nil {
+		return errors.Wrapf(err, "failed to overlaybd-commit")
+	}
+	cw, err := sr.cm.ContentStore.Writer(ctx, content.WithRef(sr.ID()))
+	if err != nil {
+		return errors.Wrapf(err, "failed to open writer")
+	}
+	fi, err := os.Open(commitPath)
+	if err != nil {
+		return errors.Wrapf(err, "failed to open overlaybd commit file")
+	}
+	sz, err := io.Copy(cw, bufio.NewReader(fi))
+	if err != nil {
+		return errors.Wrapf(err, "failed to do io.Copy()")
+	}
+	dgst := cw.Digest()
+	labels := map[string]string{
+		containerdUncompressed:       dgst.String(),
+		obdlabel.OverlayBDBlobDigest: dgst.String(),
+		obdlabel.OverlayBDBlobSize:   fmt.Sprintf("%d", sz),
+	}
+	err = cw.Commit(ctx, sz, dgst, content.WithLabels(labels))
+	if err != nil {
+		return errors.Wrapf(err, "failed to do cw.Commit")
+	}
+	desc.Digest = dgst
+	desc.Size = sz
+	desc.Annotations = map[string]string{
+		obdlabel.OverlayBDBlobDigest: string(desc.Digest),
+		obdlabel.OverlayBDBlobSize:   fmt.Sprintf("%d", desc.Size),
+	}
+	return nil
 }
