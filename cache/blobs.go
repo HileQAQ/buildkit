@@ -101,18 +101,6 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				}
 
 				compressorFunc, finalize := comp.Type.Compress(ctx, comp)
-				mediaType := comp.Type.MediaType()
-				var isOverlaybd = false
-				if sr.cm.Snapshotter.Name() == "overlaybd" {
-					snStat, err := sr.cm.Snapshotter.Stat(ctx, sr.getSnapshotID())
-					if err != nil {
-						return nil, err
-					}
-					if snStat.Labels[obdlabel.LocalOverlayBDPath] != "" {
-						isOverlaybd = true
-						mediaType = ocispecs.MediaTypeImageLayer
-					}
-				}
 				var lowerRef *immutableRef
 				switch sr.kind() {
 				case Diff:
@@ -184,6 +172,19 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 						enableOverlay = false
 					}
 				}
+				mediaType := comp.Type.MediaType()
+				if sr.cm.Snapshotter.Name() == "overlaybd" {
+					snStat, err := sr.cm.Snapshotter.Stat(ctx, sr.getSnapshotID())
+					if err != nil {
+						return nil, errors.Wrapf(err, "failed to Stat overlaybd")
+					}
+					if bdPath := snStat.Labels[obdlabel.LocalOverlayBDPath]; bdPath != "" {
+						if err := commitOverlayBD(ctx, sr, &desc); err != nil {
+							return nil, err
+						}
+						mediaType = desc.MediaType
+					}
+				}
 				if enableOverlay {
 					computed, ok, err := sr.tryComputeOverlayBlob(ctx, lower, upper, mediaType, sr.ID(), compressorFunc)
 					if !ok || err != nil {
@@ -202,13 +203,6 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					if ok {
 						desc = computed
 					}
-				}
-
-				if isOverlaybd {
-					if err := commitOverlaybd(ctx, sr, &desc); err != nil {
-						return nil, err
-					}
-					desc.MediaType = mediaType
 				}
 
 				if desc.Digest == "" && !isTypeWindows(sr) && comp.Type.NeedsComputeDiffBySelf() {
@@ -486,12 +480,16 @@ func ensureCompression(ctx context.Context, ref *immutableRef, comp compression.
 	return err
 }
 
-func commitOverlaybd(ctx context.Context, sr *immutableRef, desc *ocispecs.Descriptor) error {
+func commitOverlayBD(ctx context.Context, sr *immutableRef, desc *ocispecs.Descriptor) error {
 	snStat, err := sr.cm.Snapshotter.Stat(ctx, sr.getSnapshotID())
 	if err != nil {
 		return errors.Wrapf(err, "failed to Stat overlaybd")
 	}
-	dir := path.Dir(snStat.Labels[obdlabel.LocalOverlayBDPath])
+	bdPath := snStat.Labels[obdlabel.LocalOverlayBDPath]
+	if bdPath == "" {
+		return errors.New("missing overlaybd path label")
+	}
+	dir := path.Dir(bdPath)
 	commitPath := path.Join(dir, "overlaybd.commit")
 	err = obdcmd.Commit(ctx, dir, dir, true, "-t", "-z")
 	if err != nil {
@@ -521,6 +519,7 @@ func commitOverlaybd(ctx context.Context, sr *immutableRef, desc *ocispecs.Descr
 	}
 	desc.Digest = dgst
 	desc.Size = sz
+	desc.MediaType = ocispecs.MediaTypeImageLayer
 	desc.Annotations = map[string]string{
 		obdlabel.OverlayBDBlobDigest: string(desc.Digest),
 		obdlabel.OverlayBDBlobSize:   fmt.Sprintf("%d", desc.Size),
